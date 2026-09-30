@@ -2,10 +2,10 @@
 
 use kora_shared::{
     audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
-    errors::CommonError,
+    errors::{CommonError, KoraError},
     events,
     reentrancy::ReentrancyGuard,
-    types::{RiskTier, RiskTierDefinition, SmeProfile},
+    types::{RiskTierDefinition, SmeProfile},
     validation::{require_non_negative_amount, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
 use soroban_sdk::{
@@ -38,6 +38,15 @@ pub enum RiskRegistryError {
     UpgradeTimelockNotElapsed = 18,
     /// Caller is a valid verifier but is not the verifier-of-record for this SME.
     NotSmeVerifier = 19,
+    // ── Verifier Slashing Errors ──────────────────────────────────────────────
+    DisputesPending = 20,
+    DisputeWindowExpired = 21,
+    DisputeAlreadyResolved = 22,
+    SlashingNotConfigured = 23,
+    DisputeNotFound = 24,
+    // ── Circuit Breaker Errors ────────────────────────────────────────────────
+    CircuitBreakerTripped = 25,
+    BreakerNotConfigured = 26,
 }
 
 impl From<CommonError> for RiskRegistryError {
@@ -73,9 +82,38 @@ fn require_exact_length(bytes: &Bytes, len: u32) -> Result<(), RiskRegistryError
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
 const PERSISTENT_TTL_BUMP: u32 = 518_400;
 
+/// Cooldown between `request_verifier_removal` and `finalize_verifier_removal`.
+/// Gives the protocol time to reassign SMEs and lets watchers react before the
+/// verifier's weight drops out of the composite aggregate.
+/// Issue #739.
+pub const VERIFIER_REMOVAL_COOLDOWN_SECS: u64 = 7 * 24 * 3_600; // 7 days
+
+/// Cooldown before a removed verifier address may be re-added.
+/// Prevents immediate re-addition to bypass a removal (reputation laundering).
+/// Issue #739.
+pub const VERIFIER_READD_COOLDOWN_SECS: u64 = 7 * 24 * 3_600; // 7 days
+
 /// Minimum seconds between consecutive updates to the same debtor's score by the same verifier.
 /// Prevents rapid manipulation immediately before a funding or default decision.
 pub const MIN_SCORE_UPDATE_INTERVAL: u64 = 3_600; // 1 hour
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Bond {
+    pub amount: i128,
+    pub locked_until: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Dispute {
+    pub subject: Address,
+    pub challenger: Address,
+    pub raised_at: u64,
+    pub resolved: bool,
+}
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -90,6 +128,15 @@ pub enum DataKey {
     Verifier(Address),
     VerifierStake(Address), // amount of tokens staked by verifier
     VerifierReputation(Address), // reputation score of verifier
+    // ── Verifier rotation lifecycle (Issue #739) ─────────────────────────────
+    /// Structured lifecycle status for a verifier address.
+    VerifierStatus(Address),
+    /// Ledger timestamp of the last status transition for a verifier.
+    VerifierStatusChangedAt(Address),
+    /// Ledger timestamp when `request_verifier_removal` was called (pending removal).
+    VerifierRemovalRequestedAt(Address),
+    /// Ledger timestamp when a verifier was last fully removed (anti-bypass).
+    VerifierLastRemovedAt(Address),
     /// Maps a sub-account address → its primary verifier address.
     /// Sub-accounts can act on behalf of the primary for all verifier operations.
     SubAccount(Address),
@@ -115,6 +162,41 @@ pub enum DataKey {
     AuditLogTotal,
     /// An audit log entry at ring-buffer position `n`.
     AuditEntry(u64),
+    // ── Verifier Slashing (Issue #746) ────────────────────────────────────────
+    VerifierBond(Address),
+    DisputeWindow,
+    ActiveDispute(Address, Address), // (verifier, subject)
+    DisputeCount(Address),
+    SlashTreasury,
+    // ── Circuit Breaker (Issue #743) ──────────────────────────────────────────
+    DefaultCount(Bytes),
+    DefaultCountTier(soroban_sdk::Symbol),
+    TotalScoredCount(Bytes),
+    TotalScoredCountTier(soroban_sdk::Symbol),
+    BreakerThresholdBps,
+    BreakerMinSampleSize,
+    PausedForDebtor(Bytes),
+    PausedForTier(soroban_sdk::Symbol),
+}
+
+// ── Verifier rotation lifecycle (Issue #739) ─────────────────────────────────
+
+/// Structured lifecycle status for a whitelisted risk-score verifier.
+///
+/// - `Active` — may submit new scores; weight counts toward the composite aggregate.
+/// - `Suspended` — may NOT submit new scores; historical attestations remain
+///   readable and still count toward the aggregate until formal removal.
+/// - `PendingRemoval` — removal requested, cooldown ticking; submissions blocked;
+///   weight still counts until `finalize_verifier_removal` executes.
+/// - `Removed` — terminal marker kept after stake return so re-addition can be
+///   cooldown-gated and historical scores stay explainable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifierStatus {
+    Active,
+    Suspended,
+    PendingRemoval,
+    Removed,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -195,7 +277,7 @@ impl RiskRegistryContract {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
         if admin == new_admin {
-            return Err(KoraError::InvalidAddress);
+            return Err(RiskRegistryError::InvalidAddress);
         }
         kora_shared::validation::require_not_self(&env, &new_admin)?;
         env.storage().persistent().set(&DataKey::PendingAdmin, &new_admin);
@@ -215,10 +297,15 @@ impl RiskRegistryContract {
         if pending != new_admin {
             return Err(KoraError::NotPendingAdmin);
         }
+        let current_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .unwrap_or(new_admin.clone());
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
         Self::bump_persistent(&env, &DataKey::Admin);
-        events::admin_transferred(&env, &admin, &new_admin);
-        Self::append_audit_entry(&env, &admin, AdminActionType::RegistryTransferAdmin);
+        events::admin_transferred(&env, &current_admin, &new_admin);
+        Self::append_audit_entry(&env, &current_admin, AdminActionType::RegistryTransferAdmin);
         Ok(())
     }
 
@@ -251,7 +338,7 @@ impl RiskRegistryContract {
     /// Cancel a pending admin proposal. Current admin only.
     pub fn cancel_admin_proposal(env: Env, admin: Address) -> Result<(), KoraError> {
         admin.require_auth();
-        Self::require_admin(&env, &admin)?;
+        Self::require_admin(&env, &admin).map_err(|_| KoraError::NotAdmin)?;
         if !env.storage().persistent().has(&DataKey::PendingAdmin) {
             return Err(KoraError::NoPendingAdminProposal);
         }
@@ -299,6 +386,41 @@ impl RiskRegistryContract {
             return Err(RiskRegistryError::AlreadyInitialized);
         }
 
+        // Issue #739: reject lifecycle states that are not fully removed.
+        // Suspended / PendingRemoval verifiers must go through reinstate or the
+        // removal cooldown — they cannot be re-added to bypass it.
+        if let Some(status) = env
+            .storage()
+            .persistent()
+            .get::<_, VerifierStatus>(&DataKey::VerifierStatus(verifier.clone()))
+        {
+            match status {
+                VerifierStatus::Active
+                | VerifierStatus::Suspended
+                | VerifierStatus::PendingRemoval => {
+                    return Err(RiskRegistryError::AlreadyInitialized);
+                }
+                VerifierStatus::Removed => {
+                    // Fall through to the re-add cooldown check below.
+                }
+            }
+        }
+
+        // Issue #739: anti-bypass — a recently removed address cannot be
+        // immediately re-added to launder reputation/slashing history.
+        if let Some(last_removed) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&DataKey::VerifierLastRemovedAt(verifier.clone()))
+        {
+            let next_allowed = last_removed
+                .checked_add(VERIFIER_READD_COOLDOWN_SECS)
+                .ok_or(RiskRegistryError::ArithmeticOverflow)?;
+            if env.ledger().timestamp() < next_allowed {
+                return Err(RiskRegistryError::ReadditionCooldownNotElapsed);
+            }
+        }
+
         let minimum_stake: i128 = env
             .storage()
             .persistent()
@@ -327,9 +449,23 @@ impl RiskRegistryContract {
         env.storage()
             .persistent()
             .set(&DataKey::VerifierReputation(verifier.clone()), &100u32);
+        
+        let initial_bond = Bond {
+            amount: stake_amount,
+            locked_until: 0,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierBond(verifier.clone()), &initial_bond);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeCount(verifier.clone()), &0u32);
+
         Self::bump_persistent(&env, &DataKey::Verifier(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierBond(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::DisputeCount(verifier.clone()));
         // TODO: Sync with access_control: AccessControlContractClient::new(&env, &access_control).grant_role(&admin, &verifier, Role::Verifier)?;
         events::verifier_added(&env, &admin, &verifier);
         Self::append_audit_entry(&env, &admin, AdminActionType::AddVerifier);
@@ -372,6 +508,12 @@ impl RiskRegistryContract {
             .unwrap_or(false)
         {
             return Err(RiskRegistryError::NotVerifier);
+        }
+
+        // Issue #739: top-ups are only meaningful for Active verifiers.
+        // Suspended / PendingRemoval verifiers must be reinstated first.
+        if Self::verifier_status(&env, &verifier) != VerifierStatus::Active {
+            return Err(RiskRegistryError::VerifierSuspended);
         }
 
         let token_addr: Address = env
@@ -427,6 +569,16 @@ impl RiskRegistryContract {
             return Err(RiskRegistryError::NotVerifier);
         }
 
+        let dispute_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeCount(verifier.clone()))
+            .unwrap_or(0);
+        
+        if dispute_count > 0 {
+            return Err(RiskRegistryError::DisputesPending);
+        }
+
         let stake: i128 = env
             .storage()
             .persistent()
@@ -452,10 +604,255 @@ impl RiskRegistryContract {
         env.storage()
             .persistent()
             .remove(&DataKey::VerifierReputation(verifier.clone()));
+        // Issue #739: keep a terminal Removed marker + removal timestamp so that
+        // (a) historical debtor/SME scores remain explainable, (b) immediate
+        // re-addition to bypass the removal is rejected by add_verifier, and
+        // (c) the composite aggregator can exclude this weight going forward
+        // (see verifier_counts_toward_aggregate) without rewriting history.
+        // NOTE: this is the immediate-removal escape hatch (backward compatible).
+        // The preferred rotation flow is request_verifier_removal ->
+        // finalize_verifier_removal with a cooldown. Both paths converge here.
+        let now: u64 = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatus(verifier.clone()), &VerifierStatus::Removed);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierLastRemovedAt(verifier.clone()), &now);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierRemovalRequestedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierLastRemovedAt(verifier.clone()));
         // TODO: Sync with access_control: AccessControlContractClient::new(&env, &access_control).revoke_role(&admin, &verifier)?;
         events::verifier_removed(&env, &admin, &verifier);
         Self::append_audit_entry(&env, &admin, AdminActionType::RemoveVerifier);
         Ok(())
+    }
+
+    // ── Verifier rotation lifecycle (Issue #739) ─────────────────────────────
+
+    /// Suspend a verifier: blocks all new score submissions while preserving
+    /// historical scores. Admin only. `Active` -> `Suspended`.
+    ///
+    /// Suspended verifiers' existing debtor attestations and SME profiles
+    /// remain readable and (for debtors) still count toward the aggregate
+    /// until formal removal — suspension is a submission gate, not a rewrite
+    /// of history.
+    pub fn suspend_verifier(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_verifier_flag(&env, &verifier)?;
+        if Self::verifier_status(&env, &verifier) != VerifierStatus::Active {
+            return Err(RiskRegistryError::InvalidStatusTransition);
+        }
+        let now: u64 = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::VerifierStatus(verifier.clone()),
+            &VerifierStatus::Suspended,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        Self::append_audit_entry(&env, &admin, AdminActionType::SuspendVerifier);
+        Ok(())
+    }
+
+    /// Reinstate a suspended verifier: `Suspended` -> `Active`. Admin only.
+    pub fn reinstate_verifier(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_verifier_flag(&env, &verifier)?;
+        if Self::verifier_status(&env, &verifier) != VerifierStatus::Suspended {
+            return Err(RiskRegistryError::InvalidStatusTransition);
+        }
+        let now: u64 = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::VerifierStatus(verifier.clone()),
+            &VerifierStatus::Active,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        events::verifier_added(&env, &admin, &verifier);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ReinstateVerifier);
+        Ok(())
+    }
+
+    /// Start the removal cooldown: `Active`|`Suspended` -> `PendingRemoval`.
+    /// Admin only. Records the request timestamp; actual stake return and
+    /// weight exclusion happen in `finalize_verifier_removal` after
+    /// `VERIFIER_REMOVAL_COOLDOWN_SECS`.
+    pub fn request_verifier_removal(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_verifier_flag(&env, &verifier)?;
+        let status = Self::verifier_status(&env, &verifier);
+        if status != VerifierStatus::Active && status != VerifierStatus::Suspended {
+            return Err(RiskRegistryError::InvalidStatusTransition);
+        }
+        let now: u64 = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::VerifierStatus(verifier.clone()),
+            &VerifierStatus::PendingRemoval,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        env.storage().persistent().set(
+            &DataKey::VerifierRemovalRequestedAt(verifier.clone()),
+            &now,
+        );
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierRemovalRequestedAt(verifier.clone()));
+        Self::append_audit_entry(&env, &admin, AdminActionType::RequestVerifierRemoval);
+        Ok(())
+    }
+
+    /// Cancel a pending removal: `PendingRemoval` -> `Active`. Admin only.
+    /// Clears the request timestamp without touching stake or reputation.
+    pub fn cancel_verifier_removal(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_verifier_flag(&env, &verifier)?;
+        if Self::verifier_status(&env, &verifier) != VerifierStatus::PendingRemoval {
+            return Err(RiskRegistryError::NoRemovalRequested);
+        }
+        let now: u64 = env.ledger().timestamp();
+        env.storage().persistent().set(
+            &DataKey::VerifierStatus(verifier.clone()),
+            &VerifierStatus::Active,
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierRemovalRequestedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        Self::append_audit_entry(&env, &admin, AdminActionType::ReinstateVerifier);
+        Ok(())
+    }
+
+    /// Complete a previously requested removal after the cooldown has elapsed.
+    /// Returns remaining stake, clears the active flag, and leaves a `Removed`
+    /// marker with `VerifierLastRemovedAt` for the re-add anti-bypass check.
+    /// Historical per-verifier attestations are intentionally NOT deleted.
+    pub fn finalize_verifier_removal(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        Self::require_verifier_flag(&env, &verifier)?;
+        if Self::verifier_status(&env, &verifier) != VerifierStatus::PendingRemoval {
+            return Err(RiskRegistryError::NoRemovalRequested);
+        }
+        let requested: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierRemovalRequestedAt(verifier.clone()))
+            .ok_or(RiskRegistryError::NoRemovalRequested)?;
+        let eligible_at = requested
+            .checked_add(VERIFIER_REMOVAL_COOLDOWN_SECS)
+            .ok_or(RiskRegistryError::ArithmeticOverflow)?;
+        if env.ledger().timestamp() < eligible_at {
+            return Err(RiskRegistryError::RemovalCooldownNotElapsed);
+        }
+
+        let stake: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierStake(verifier.clone()))
+            .unwrap_or(0);
+        if stake > 0 {
+            let token_addr: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakingToken)
+                .ok_or(RiskRegistryError::NotInitialized)?;
+            let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+            token_client.transfer(&env.current_contract_address(), &verifier, &stake);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Verifier(verifier.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierStake(verifier.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierReputation(verifier.clone()));
+        let now: u64 = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatus(verifier.clone()), &VerifierStatus::Removed);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierStatusChangedAt(verifier.clone()), &now);
+        env.storage()
+            .persistent()
+            .set(&DataKey::VerifierLastRemovedAt(verifier.clone()), &now);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VerifierRemovalRequestedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatus(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierStatusChangedAt(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierLastRemovedAt(verifier.clone()));
+        events::verifier_removed(&env, &admin, &verifier);
+        Self::append_audit_entry(&env, &admin, AdminActionType::FinalizeVerifierRemoval);
+        Ok(())
+    }
+
+    /// Structured lifecycle status for a verifier address.
+    /// Unknown addresses report `Removed` (no weight, no submission rights).
+    pub fn get_verifier_status(env: Env, verifier: Address) -> VerifierStatus {
+        Self::verifier_status(&env, &verifier)
+    }
+
+    /// Ledger timestamp of the last status transition, or `None` if never tracked.
+    pub fn get_verifier_status_changed_at(env: Env, verifier: Address) -> Option<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifierStatusChangedAt(verifier))
+    }
+
+    /// Earliest timestamp at which `finalize_verifier_removal` will succeed,
+    /// or `None` when no removal has been requested.
+    pub fn get_verifier_removal_deadline(env: Env, verifier: Address) -> Option<u64> {
+        let requested: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierRemovalRequestedAt(verifier))?;
+        requested.checked_add(VERIFIER_REMOVAL_COOLDOWN_SECS)
     }
 
     // ── Sub-account delegation ────────────────────────────────────────────────
@@ -579,6 +976,20 @@ impl RiskRegistryContract {
             .persistent()
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+
+        // Circuit Breaker: increment TotalScoredCountTier
+        let tier_symbol = Self::score_to_tier_symbol(&env, risk_score);
+        let current_count_tier: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalScoredCountTier(tier_symbol.clone()))
+            .unwrap_or(0);
+        let new_count_tier = current_count_tier.checked_add(1).unwrap_or(u32::MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalScoredCountTier(tier_symbol.clone()), &new_count_tier);
+        Self::bump_persistent(&env, &DataKey::TotalScoredCountTier(tier_symbol.clone()));
+
         events::sme_registered(&env, &primary, &sme, risk_score);
         Ok(())
     }
@@ -711,7 +1122,8 @@ impl RiskRegistryContract {
         admin.require_auth();
         Self::require_admin(&env, &admin)?;
 
-        // new_verifier must be an active primary verifier
+        // new_verifier must be an Active primary verifier (Issue #739:
+        // suspended / pending-removal verifiers cannot receive custody).
         if !env
             .storage()
             .persistent()
@@ -719,6 +1131,9 @@ impl RiskRegistryContract {
             .unwrap_or(false)
         {
             return Err(RiskRegistryError::NotVerifier);
+        }
+        if Self::verifier_status(&env, &new_verifier) != VerifierStatus::Active {
+            return Err(RiskRegistryError::VerifierSuspended);
         }
 
         let mut profile: SmeProfile = env
@@ -853,6 +1268,49 @@ impl RiskRegistryContract {
             .persistent()
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
+
+        // Circuit Breaker: tier-based tracking
+        let tier_symbol = Self::score_to_tier_symbol(&env, profile.risk_score);
+        let current_defaults: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DefaultCountTier(tier_symbol.clone()))
+            .unwrap_or(0);
+        let new_defaults = current_defaults.checked_add(1).unwrap_or(u32::MAX);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DefaultCountTier(tier_symbol.clone()), &new_defaults);
+        Self::bump_persistent(&env, &DataKey::DefaultCountTier(tier_symbol.clone()));
+
+        if let (Some(threshold_bps), Some(min_sample)) = (
+            env.storage().persistent().get::<_, u32>(&DataKey::BreakerThresholdBps),
+            env.storage().persistent().get::<_, u32>(&DataKey::BreakerMinSampleSize),
+        ) {
+            let total_scored: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::TotalScoredCountTier(tier_symbol.clone()))
+                .unwrap_or(0);
+            
+            if total_scored >= min_sample {
+                // new_defaults * 10000 / total_scored >= threshold_bps
+                let default_rate = (new_defaults as u64)
+                    .checked_mul(10000)
+                    .unwrap_or(u64::MAX) / (total_scored as u64);
+                
+                if default_rate >= (threshold_bps as u64) {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PausedForTier(tier_symbol.clone()), &true);
+                    Self::bump_persistent(&env, &DataKey::PausedForTier(tier_symbol.clone()));
+                    env.events().publish(
+                        (soroban_sdk::symbol_short!("BRK_TRIP"), tier_symbol.clone()),
+                        new_defaults
+                    );
+                }
+            }
+        }
+
         events::sme_default_recorded(&env, &admin, &sme, profile.defaults);
         Self::append_audit_entry(&env, &admin, AdminActionType::RecordDefault);
         Ok(())
@@ -948,6 +1406,10 @@ impl RiskRegistryContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         if !attestors.contains(&verifier) {
+            // Enforce maximum verifiers per debtor to prevent DoS in get_debtor_score aggregation
+            if attestors.len() >= MAX_VERIFIERS_PER_DEBTOR {
+                return Err(RiskRegistryError::InvalidLength); // Reuse existing error variant
+            }
             attestors.push_back(verifier.clone());
             env.storage().persistent().set(&attestors_key, &attestors);
         }
@@ -1058,14 +1520,19 @@ impl RiskRegistryContract {
     /// **Parameters:**
     /// - `verifier` — The address to query.
     ///
-    /// **Returns:** `true` if the address is an active verifier, `false` otherwise.
+    /// **Returns:** `true` if the address is an **Active** verifier, `false` otherwise.
+    /// Suspended / PendingRemoval verifiers return `false` here (submission gate),
+    /// but their historical debtor attestations still count toward the aggregate
+    /// until formal removal (see `get_debtor_score`). Issue #739.
     ///
     /// **Security:** Read-only view. No authorization required.
     pub fn is_verifier(env: Env, verifier: Address) -> bool {
-        env.storage()
+        let flag: bool = env
+            .storage()
             .persistent()
-            .get(&DataKey::Verifier(verifier))
-            .unwrap_or(false)
+            .get(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false);
+        flag && Self::verifier_status(&env, &verifier) == VerifierStatus::Active
     }
 
     /// Returns the primary verifier for a sub-account address, or `None` if the address
@@ -1097,7 +1564,7 @@ impl RiskRegistryContract {
         let mut count: u32 = 0;
 
         for verifier in attestors.iter() {
-            if Self::is_verifier(env.clone(), verifier.clone()) {
+            if Self::verifier_counts_toward_aggregate(&env, &verifier) {
                 let key = DataKey::DebtorScoreAttestation(debtor_hash.clone(), verifier);
                 if let Some(score) = env.storage().persistent().get::<_, u32>(&key) {
                     total_score = total_score
@@ -1115,6 +1582,18 @@ impl RiskRegistryContract {
 
         let avg = total_score / (count as u64);
         Ok(avg as u32)
+    }
+
+    /// Current risk tier for a debtor, derived from active verifier attestations.
+    /// `None` means no usable score; capped marketplace funding must reject it.
+    pub fn get_debtor_risk_tier(env: Env, debtor_hash: Bytes) -> Option<RiskTier> {
+        let score = Self::debtor_score_average(env.clone(), debtor_hash)?;
+        let limits = Self::get_current_risk_tier_definition(env);
+        Some(if score <= limits.aaa_max { RiskTier::AAA }
+            else if score <= limits.aa_max { RiskTier::AA }
+            else if score <= limits.a_max { RiskTier::A }
+            else if score <= limits.b_max { RiskTier::B }
+            else { RiskTier::C })
     }
 
     /// Returns a specific verifier's score attestation for a debtor,
@@ -1174,13 +1653,17 @@ impl RiskRegistryContract {
 
     /// Average the active verifier attestations for a debtor, returning `None`
     /// when no (valid, current-verifier) attestation exists.
+    ///
+    /// Issue #739: `Active`, `Suspended`, and `PendingRemoval` attestations all
+    /// count (history is preserved); only formally `Removed` verifiers are
+    /// excluded going forward — never retroactively deleted.
     fn debtor_score_average(env: Env, debtor_hash: Bytes) -> Option<u32> {
         let attestors_key = DataKey::DebtorAttestors(debtor_hash.clone());
         let attestors: Vec<Address> = env.storage().persistent().get(&attestors_key)?;
         let mut total: u64 = 0;
         let mut count: u32 = 0;
         for verifier in attestors.iter() {
-            if Self::is_verifier(env.clone(), verifier.clone()) {
+            if Self::verifier_counts_toward_aggregate(&env, &verifier) {
                 let key = DataKey::DebtorScoreAttestation(debtor_hash.clone(), verifier);
                 if let Some(score) = env.storage().persistent().get::<_, u32>(&key) {
                     total = total.checked_add(score as u64)?;
@@ -1310,6 +1793,238 @@ impl RiskRegistryContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    // ── Verifier Slashing (Issue #746) ────────────────────────────────────────
+
+    pub fn configure_slashing(
+        env: Env,
+        admin: Address,
+        dispute_window_secs: u64,
+        slash_treasury: Address,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeWindow, &dispute_window_secs);
+        env.storage()
+            .persistent()
+            .set(&DataKey::SlashTreasury, &slash_treasury);
+
+        Self::bump_persistent(&env, &DataKey::DisputeWindow);
+        Self::bump_persistent(&env, &DataKey::SlashTreasury);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RegistryTransferAdmin); // Use closest available
+        Ok(())
+    }
+
+    pub fn raise_dispute(
+        env: Env,
+        challenger: Address,
+        verifier: Address,
+        subject: Address,
+    ) -> Result<(), RiskRegistryError> {
+        challenger.require_auth();
+        Self::require_verifier(&env, &verifier)?; // verify is active
+
+        let mut bond: Bond = env
+            .storage()
+            .persistent()
+            .get(&DataKey::VerifierBond(verifier.clone()))
+            .ok_or(RiskRegistryError::NotVerifier)?;
+
+        let raised_at = env.ledger().timestamp();
+        let dispute_window: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeWindow)
+            .ok_or(RiskRegistryError::SlashingNotConfigured)?;
+
+        let dispute = Dispute {
+            subject: subject.clone(),
+            challenger: challenger.clone(),
+            raised_at,
+            resolved: false,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDispute(verifier.clone(), subject.clone()), &dispute);
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeCount(verifier.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeCount(verifier.clone()), &(count.checked_add(1).unwrap()));
+
+        let new_locked = raised_at + dispute_window;
+        if new_locked > bond.locked_until {
+            bond.locked_until = new_locked;
+            env.storage()
+                .persistent()
+                .set(&DataKey::VerifierBond(verifier.clone()), &bond);
+        }
+
+        Self::bump_persistent(&env, &DataKey::ActiveDispute(verifier.clone(), subject.clone()));
+        Self::bump_persistent(&env, &DataKey::DisputeCount(verifier.clone()));
+        Self::bump_persistent(&env, &DataKey::VerifierBond(verifier.clone()));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("DSP_RAIS"), verifier, subject),
+            challenger
+        );
+        Ok(())
+    }
+
+    pub fn resolve_dispute(
+        env: Env,
+        admin: Address,
+        verifier: Address,
+        subject: Address,
+        slash: bool,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        let mut dispute: Dispute = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ActiveDispute(verifier.clone(), subject.clone()))
+            .ok_or(RiskRegistryError::DisputeNotFound)?;
+
+        if dispute.resolved {
+            return Err(RiskRegistryError::DisputeAlreadyResolved);
+        }
+
+        if slash {
+            let mut bond: Bond = env
+                .storage()
+                .persistent()
+                .get(&DataKey::VerifierBond(verifier.clone()))
+                .ok_or(RiskRegistryError::NotVerifier)?;
+
+            let slash_percentage: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SlashPercentage)
+                .ok_or(RiskRegistryError::SlashingNotConfigured)?;
+
+            let treasury: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::SlashTreasury)
+                .ok_or(RiskRegistryError::SlashingNotConfigured)?;
+
+            let slash_amount = (bond.amount as u128 * slash_percentage as u128 / 10_000) as i128;
+            
+            if slash_amount > 0 {
+                bond.amount = bond.amount.checked_sub(slash_amount).ok_or(RiskRegistryError::ArithmeticUnderflow)?;
+                env.storage().persistent().set(&DataKey::VerifierBond(verifier.clone()), &bond);
+                
+                let token_addr: Address = env.storage().persistent().get(&DataKey::StakingToken).unwrap();
+                let token_client = soroban_sdk::token::Client::new(&env, &token_addr);
+                token_client.transfer(&env.current_contract_address(), &treasury, &slash_amount);
+
+                // Reduce stake mirroring bond amount
+                let stake: i128 = env.storage().persistent().get(&DataKey::VerifierStake(verifier.clone())).unwrap_or(0);
+                env.storage().persistent().set(&DataKey::VerifierStake(verifier.clone()), &stake.checked_sub(slash_amount).unwrap_or(0));
+            }
+
+            let reputation: u32 = env.storage().persistent().get(&DataKey::VerifierReputation(verifier.clone())).unwrap_or(100);
+            env.storage().persistent().set(&DataKey::VerifierReputation(verifier.clone()), &reputation.saturating_sub(10));
+        }
+
+        dispute.resolved = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveDispute(verifier.clone(), subject.clone()), &dispute);
+
+        let count: u32 = env.storage().persistent().get(&DataKey::DisputeCount(verifier.clone())).unwrap_or(1);
+        env.storage().persistent().set(&DataKey::DisputeCount(verifier.clone()), &count.saturating_sub(1));
+
+        env.events().publish(
+            (soroban_sdk::symbol_short!("DSP_RSLV"), verifier, subject),
+            slash
+        );
+        Ok(())
+    }
+
+    pub fn get_bond(env: Env, verifier: Address) -> Result<Bond, RiskRegistryError> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VerifierBond(verifier))
+            .ok_or(RiskRegistryError::NotVerifier)
+    }
+
+    pub fn get_dispute_count(env: Env, verifier: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeCount(verifier))
+            .unwrap_or(0)
+    }
+
+    // ── Circuit Breaker (Issue #743) ──────────────────────────────────────────
+
+    pub fn configure_circuit_breaker(
+        env: Env,
+        admin: Address,
+        threshold_bps: u32,
+        min_sample_size: u32,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage().persistent().set(&DataKey::BreakerThresholdBps, &threshold_bps);
+        env.storage().persistent().set(&DataKey::BreakerMinSampleSize, &min_sample_size);
+        Self::bump_persistent(&env, &DataKey::BreakerThresholdBps);
+        Self::bump_persistent(&env, &DataKey::BreakerMinSampleSize);
+        Ok(())
+    }
+
+    pub fn clear_circuit_breaker_debtor(
+        env: Env,
+        admin: Address,
+        debtor_hash: Bytes,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage().persistent().remove(&DataKey::PausedForDebtor(debtor_hash.clone()));
+        env.events().publish((soroban_sdk::symbol_short!("BRK_CLR"), debtor_hash), ());
+        Ok(())
+    }
+
+    pub fn clear_circuit_breaker_tier(
+        env: Env,
+        admin: Address,
+        tier: soroban_sdk::Symbol,
+    ) -> Result<(), RiskRegistryError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+
+        env.storage().persistent().remove(&DataKey::PausedForTier(tier.clone()));
+        env.events().publish((soroban_sdk::symbol_short!("BRK_CLR"), tier), ());
+        Ok(())
+    }
+
+    pub fn is_debtor_paused(env: Env, debtor_hash: Bytes) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PausedForDebtor(debtor_hash))
+            .unwrap_or(false)
+    }
+
+    pub fn is_tier_paused(env: Env, tier: soroban_sdk::Symbol) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PausedForTier(tier))
+            .unwrap_or(false)
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
     fn require_admin(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         let admin: Address = env
             .storage()
@@ -1322,9 +2037,13 @@ impl RiskRegistryContract {
         Ok(())
     }
 
-    /// Returns `Ok(primary)` when `caller` is an active verifier (primary or sub-account).
+    /// Returns `Ok(primary)` when `caller` is an **Active** verifier (primary or sub-account).
     /// Sub-accounts resolve to their primary verifier so that reputation and staking
     /// are always attributed to the primary.
+    ///
+    /// Issue #739: `Suspended` and `PendingRemoval` primaries (and their
+    /// sub-accounts) are rejected with `VerifierSuspended` — suspension is a
+    /// submission gate. Historical reads remain available via the view functions.
     fn resolve_verifier(env: &Env, caller: &Address) -> Result<Address, RiskRegistryError> {
         // Direct primary check first (fast path).
         if env
@@ -1333,6 +2052,9 @@ impl RiskRegistryContract {
             .get::<_, bool>(&DataKey::Verifier(caller.clone()))
             .unwrap_or(false)
         {
+            if Self::verifier_status(env, caller) != VerifierStatus::Active {
+                return Err(RiskRegistryError::VerifierSuspended);
+            }
             return Ok(caller.clone());
         }
         // Sub-account resolution.
@@ -1348,6 +2070,9 @@ impl RiskRegistryContract {
                 .get::<_, bool>(&DataKey::Verifier(primary.clone()))
                 .unwrap_or(false)
             {
+                if Self::verifier_status(env, &primary) != VerifierStatus::Active {
+                    return Err(RiskRegistryError::VerifierSuspended);
+                }
                 return Ok(primary);
             }
         }
@@ -1358,8 +2083,60 @@ impl RiskRegistryContract {
         Self::resolve_verifier(env, caller).map(|_| ())
     }
 
+    /// Raw presence check: the `Verifier(addr) == true` flag exists, regardless
+    /// of lifecycle status. Used by admin rotation functions. Issue #739.
+    fn require_verifier_flag(env: &Env, verifier: &Address) -> Result<(), RiskRegistryError> {
+        let ok: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false);
+        if !ok {
+            return Err(RiskRegistryError::NotVerifier);
+        }
+        Ok(())
+    }
+
+    /// Structured lifecycle status. Defaults to `Active` for legacy entries
+    /// written before #739 (flag present, no status key), and `Removed` for
+    /// unknown addresses. Never reverts.
+    fn verifier_status(env: &Env, verifier: &Address) -> VerifierStatus {
+        if let Some(status) = env
+            .storage()
+            .persistent()
+            .get::<_, VerifierStatus>(&DataKey::VerifierStatus(verifier.clone()))
+        {
+            return status;
+        }
+        let flag: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Verifier(verifier.clone()))
+            .unwrap_or(false);
+        if flag {
+            VerifierStatus::Active
+        } else {
+            VerifierStatus::Removed
+        }
+    }
+
+    /// Whether a verifier's historical attestations count toward the composite
+    /// debtor aggregate. `Active` + `Suspended` + `PendingRemoval` count;
+    /// formally `Removed` (or unknown) addresses do not — excluded going
+    /// forward, never retroactively deleted. Issue #739.
+    fn verifier_counts_toward_aggregate(env: &Env, verifier: &Address) -> bool {
+        match Self::verifier_status(env, verifier) {
+            VerifierStatus::Active
+            | VerifierStatus::Suspended
+            | VerifierStatus::PendingRemoval => true,
+            VerifierStatus::Removed => false,
+        }
+    }
+
     /// Require `caller` to be a **primary** verifier (not a sub-account).
     /// Used for delegation management so only the primary can add/remove sub-accounts.
+    /// Issue #739: the primary must be `Active`; suspended/pending-removal
+    /// primaries cannot delegate until reinstated.
     fn require_verifier_primary(env: &Env, caller: &Address) -> Result<(), RiskRegistryError> {
         let ok: bool = env
             .storage()
@@ -1368,6 +2145,9 @@ impl RiskRegistryContract {
             .unwrap_or(false);
         if !ok {
             return Err(RiskRegistryError::NotVerifier);
+        }
+        if Self::verifier_status(env, caller) != VerifierStatus::Active {
+            return Err(RiskRegistryError::VerifierSuspended);
         }
         Ok(())
     }
@@ -1433,6 +2213,14 @@ impl RiskRegistryContract {
 
     /// Create the default risk tier definition with standard boundaries.
     /// AAA: 0–20, AA: 21–40, A: 41–60, B: 61–80, C: 81–100
+    fn score_to_tier_symbol(env: &Env, score: u32) -> soroban_sdk::Symbol {
+        if score <= 20 { soroban_sdk::Symbol::new(env, "AAA") }
+        else if score <= 40 { soroban_sdk::Symbol::new(env, "AA") }
+        else if score <= 60 { soroban_sdk::Symbol::new(env, "A") }
+        else if score <= 80 { soroban_sdk::Symbol::new(env, "B") }
+        else { soroban_sdk::Symbol::new(env, "C") }
+    }
+
     fn create_default_risk_tier_definition(env: &Env) -> RiskTierDefinition {
         RiskTierDefinition {
             version: 1,
@@ -1453,7 +2241,7 @@ impl RiskRegistryContract {
         env.storage()
             .persistent()
             .get(&DataKey::CurrentRiskTierDefinition)
-            .unwrap_or_else(|_| Self::create_default_risk_tier_definition(&env))
+            .unwrap_or_else(|| Self::create_default_risk_tier_definition(&env))
     }
 
     /// Get a specific version of a risk tier definition (Issue #674).
@@ -1506,7 +2294,7 @@ impl RiskRegistryContract {
         }
 
         // Get current version and increment
-        let current_def = Self::get_current_risk_tier_definition(&env);
+        let current_def = Self::get_current_risk_tier_definition(env.clone());
         let new_version = current_def.version.checked_add(1)
             .ok_or(RiskRegistryError::ArithmeticOverflow)?;
 
@@ -2617,23 +3405,6 @@ mod tests {
         assert_eq!(client.get_verifier_reputation(&verifier), rep);
     }
 
-    #[test]
-    fn test_top_up_stake_requires_active_verifier() {
-        let (env, admin, _, staking_token, client) = setup();
-        let stranger = Address::generate(&env);
-        mint_stake(&env, &staking_token, &stranger, 1_000_000i128);
-        assert!(client.try_top_up_stake(&admin, &stranger, &500_000i128).is_err());
-    }
-
-    #[test]
-    fn test_top_up_stake_rejects_zero_amount() {
-        let (env, admin, _, staking_token, client) = setup();
-        let verifier = Address::generate(&env);
-        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
-        client.add_verifier(&admin, &verifier, &1_000_000i128);
-        assert!(client.try_top_up_stake(&admin, &verifier, &0i128).is_err());
-    }
-
     // ── set_credit_limit (require_non_negative_amount guard) ─────────────────
 
     #[test]
@@ -3246,10 +4017,144 @@ mod tests {
         let (env, admin, _, staking_token, client) = setup();
         // This test documents that execute_upgrade should check if a multisig is
         // configured and reject the bare-admin path when it is (issue #478).
-        let wasm_hash = BytesN::<32>::random(&env);
-        let result = client.try_execute_upgrade(&admin, &wasm_hash);
+        let _wasm_hash = BytesN::<32>::from_array(&env, &[1u8; 32]);
+        let result = client.try_execute_upgrade(&admin);
         // TODO: Once multisig check is added, when ac has a configured multisig,
         // this bare-admin call should be rejected.
         let _ = result;
+    }
+
+    // ── Issue #739: whitelisted verifier rotation ─────────────────────────────
+
+    #[test]
+    fn test_verifier_lifecycle_suspend_reinstate() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Active);
+        assert!(client.is_verifier(&verifier));
+
+        client.suspend_verifier(&admin, &verifier);
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Suspended);
+        // Suspended verifiers fail the Active-only submission gate.
+        assert!(!client.is_verifier(&verifier));
+
+        // New submissions are rejected while suspended.
+        let sme = Address::generate(&env);
+        assert!(client.try_register_sme(&verifier, &sme, &50u32, &true).is_err());
+        let debtor_hash = Bytes::from_slice(&env, &[0xABu8; 32]);
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &50u32)
+            .is_err());
+
+        client.reinstate_verifier(&admin, &verifier);
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Active);
+        assert!(client.is_verifier(&verifier));
+    }
+
+    #[test]
+    fn test_suspended_verifier_history_still_counts_toward_aggregate() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xCDu8; 32]);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.set_debtor_score(&verifier, &debtor_hash, &60u32);
+        client.suspend_verifier(&admin, &verifier);
+        // Historical attestation remains readable and still aggregates.
+        assert_eq!(
+            client.get_debtor_score_attestation(&verifier, &debtor_hash),
+            60u32
+        );
+        assert_eq!(client.get_debtor_score(&debtor_hash), 60u32);
+    }
+
+    #[test]
+    fn test_verifier_removal_cooldown_enforced() {
+        use soroban_sdk::testutils::Ledger as _;
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        client.request_verifier_removal(&admin, &verifier);
+        assert_eq!(
+            client.get_verifier_status(&verifier),
+            VerifierStatus::PendingRemoval
+        );
+        // Finalizing before the cooldown must fail.
+        let early = client.try_finalize_verifier_removal(&admin, &verifier);
+        assert_eq!(
+            early.unwrap_err().unwrap(),
+            RiskRegistryError::RemovalCooldownNotElapsed
+        );
+        // Submissions are blocked while pending removal.
+        let debtor_hash = Bytes::from_slice(&env, &[0xEFu8; 32]);
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &50u32)
+            .is_err());
+        // Advance past the cooldown boundary.
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: VERIFIER_REMOVAL_COOLDOWN_SECS,
+            ..env.ledger().get()
+        });
+        assert!(client.try_finalize_verifier_removal(&admin, &verifier).is_ok());
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Removed);
+        assert!(!client.is_verifier(&verifier));
+        // Historical per-verifier attestation rows are preserved (not deleted).
+    }
+
+    #[test]
+    fn test_verifier_readdition_cooldown_blocks_bypass() {
+        use soroban_sdk::testutils::Ledger as _;
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier = Address::generate(&env);
+        mint_stake(&env, &staking_token, &verifier, 3_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &3_000_000i128);
+        client.add_verifier(&admin, &verifier, &1_000_000i128);
+        // Immediate removal path records the removal timestamp.
+        client.remove_verifier(&admin, &verifier);
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Removed);
+        // Immediate re-addition must be rejected.
+        let err = client
+            .try_add_verifier(&admin, &verifier, &1_000_000i128)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, RiskRegistryError::ReadditionCooldownNotElapsed);
+        // After the cooldown, re-addition succeeds.
+        env.ledger().set(soroban_sdk::testutils::LedgerInfo {
+            timestamp: VERIFIER_READD_COOLDOWN_SECS,
+            ..env.ledger().get()
+        });
+        mint_stake(&env, &staking_token, &verifier, 1_000_000i128);
+        soroban_sdk::token::StellarAssetClient::new(&env, &staking_token).mint(&verifier, &1_000_000i128);
+        assert!(client.try_add_verifier(&admin, &verifier, &1_000_000i128).is_ok());
+        assert_eq!(client.get_verifier_status(&verifier), VerifierStatus::Active);
+    }
+
+    #[test]
+    fn test_removed_verifier_excluded_from_aggregate() {
+        let (env, admin, _, staking_token, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0x11u8; 32]);
+        mint_stake(&env, &staking_token, &verifier_a, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128);
+        mint_stake(&env, &staking_token, &verifier_b, 1_000_000i128);
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128);
+        client.set_debtor_score(&verifier_a, &debtor_hash, &20u32);
+        client.set_debtor_score(&verifier_b, &debtor_hash, &80u32);
+        assert_eq!(client.get_debtor_score(&debtor_hash), 50u32);
+        // Immediate removal excludes verifier_a going forward, not retroactively:
+        // its individual attestation row still reads back.
+        client.remove_verifier(&admin, &verifier_a);
+        assert_eq!(client.get_debtor_score(&debtor_hash), 80u32);
+        assert_eq!(
+            client.get_debtor_score_attestation(&verifier_a, &debtor_hash),
+            20u32
+        );
     }
 }

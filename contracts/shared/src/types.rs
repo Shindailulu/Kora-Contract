@@ -129,6 +129,34 @@ pub struct Bid {
     pub submitted_at: u64,
 }
 
+/// A single scheduled repayment installment.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Installment {
+    pub amount: i128,
+    pub due_date: u64,
+    pub paid: bool,
+}
+
+/// An installment repayment schedule attached to a financing pool.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InstallmentSchedule {
+    pub installments: Vec<Installment>,
+    /// Index of the next unpaid installment.
+    pub next_index: u32,
+}
+
+/// Protocol-wide aggregate statistics tracked by the financing pool.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ProtocolStats {
+    pub pools_opened: u32,
+    pub total_repaid: i128,
+    pub pools_defaulted: u32,
+    pub active_pools: u32,
+}
+
 /// A single investor position in a pool
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -246,47 +274,448 @@ pub enum AdminAction {
     RevokeRole(Address),
     TransferAdmin(Address),
     /// Rotate the admin key to a new address.
-    /// Identical effect to
+    /// Identical effect to `TransferAdmin` but signals deliberate key-rotation
+    /// semantics (e.g. after a suspected compromise) rather than an ordinary
+    /// ownership handoff. Emits a dedicated `admin_rotated` event for
+    /// off-chain monitoring to alert on.
     RotateAdmin(Address),
-    /// Replace the co-signer set and/or threshold. Requires its own quorum.
-    UpdateSigners(Vec<Address>, u32),
+    /// Resolve a dispute through governance (Issue #671).
+    /// Requires multisig quorum approval and governance timelock.
+    /// Parameters: (dispute_resolver, invoice_id, upheld)
+    ResolveDispute(Address, u64, bool),
 }
 
-/// Multi-signature governance configuration for the access-control contract.
-///
-/// Holds the set of co-signers and the N-of-M approval threshold. Privileged
-/// operations are only executed once a quorum of distinct co-signers has
-/// approved the corresponding `PendingAction` within the configured window.
+/// A multisig proposal awaiting approval
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Proposal {
+    pub id: u64,
+    pub action: AdminAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>,
+    pub executed: bool,
+    pub cancelled: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+/// Multisig configuration
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct MultisigConfig {
-    /// The set of authorized co-signers (M).
-    pub signers: Vec<Address>,
-    /// Number of distinct approvals required to execute an action (N).
     pub threshold: u32,
-    /// Maximum age (in seconds) a pending action may remain open before it
-    /// expires and can no longer be executed.
-    pub window_secs: u64,
+    pub signers: Vec<Address>,
+}
+
+/// A tunable protocol parameter governed by the parameter-change process.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParameterKey {
+    FeeBps,         // protocol fee in basis points
+    LatePenaltyBps, // late-repayment penalty in basis points
+    MaxRiskScore,   // ceiling for accepted invoice risk scores (0–100)
+    TimelockDelay,  // governance timelock duration in seconds (issue #670)
+}
+
+/// Verifier management actions governed by the governance process.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifierAction {
+    /// Onboard a new verifier to the risk registry
+    OnboardVerifier(Address),
+    /// Remove an existing verifier from the risk registry
+    RemoveVerifier(Address),
+}
+
+/// A governance proposal to change a single protocol parameter.
+///
+/// Reuses the B2 multisig signer set for gating and a B1-style timelock before execution.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ParameterProposal {
+    pub id: u64,
+    pub key: ParameterKey,
+    pub new_value: u32,
+    pub proposer: Address,
+    pub approvals: Vec<Address>, // signers that have voted in favour
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// A governance proposal for verifier onboarding or removal.
+///
+/// Reuses the B2 multisig signer set for gating and a B1-style timelock before execution.
+/// Ensures verifier trust is maintained through the same governance rigor as protocol parameters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct VerifierProposal {
+    pub id: u64,
+    pub action: VerifierAction,
+    pub proposer: Address,
+    pub approvals: Vec<Address>, // signers that have voted in favour
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// A multisig signer recovery proposal for lost-key scenarios.
+/// Allows reconfiguring the signer set after a long timelock if quorum becomes unreachable.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RecoveryProposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub new_signers: Vec<Address>,
+    pub new_threshold: u32,
+    pub created_at: u64,
+    pub objections: Vec<Address>, // signers that have objected to recovery
+    pub executed: bool,
+}
+
+/// A governance proposal to adjust the multisig signer set and threshold.
+///
+/// This meta-governance proposal allows the multisig itself to be reconfigured through
+/// formal proposal/voting/execution, ensuring signer set changes are subject to the same
+/// governance rigor as protocol parameter changes. The new signer set only activates
+/// after its own timelock expires, preventing immediate control changes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SignerSetProposal {
+    pub id: u64,
+    pub new_signers: Vec<Address>,
+    pub new_threshold: u32,
+    pub proposer: Address,
+    pub approvals: Vec<Address>, // current signers that have voted in favour
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub executed: bool,
+    pub cancelled: bool,
+}
+
+/// A fractional claim on a Position, enabling secondary-market transfers
+/// before the underlying invoice is repaid or defaulted. (#563)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PositionShare {
+    pub invoice_id: u64,
+    pub original_investor: Address,
+    pub share_index: u32,
+    pub amount: i128,
+    pub owner: Address,
+}
+
+/// An offer to sell a single fractional share of a position on the secondary market. (#563)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ShareSaleOffer {
+    pub seller: Address,
+    pub invoice_id: u64,
+    pub original_investor: Address,
+    pub share_index: u32,
+    pub token: Address,
+    pub price: i128,
+}
+
+/// Dispute state for an invoice under governance review. (#565)
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Dispute {
+    pub invoice_id: u64,
+    pub challenger: Address,
+    pub evidence_cid: Option<String>,
+    pub opened_at: u64,
+    pub resolved: bool,
+    pub upheld: bool,
+    pub resolved_at: u64,
+}
+
+/// A community proposal staged for signer review (Issue #672).
+/// Non-signers can submit proposals; signers then review and formally sponsor them
+/// for inclusion in the multisig governance workflow.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct CommunityProposal {
+    pub id: u64,
+    pub submitter: Address,
+    pub action: AdminAction,
+    pub description: String,
+    pub submitted_at: u64,
+    pub expires_at: u64,
+}
+
+/// Asset allocation policy for treasury diversification (Issue #673).
+/// Defines target allocation ranges for each asset type to prevent unintended
+/// concentration of treasury holdings. Used by check_allocation_drift to identify
+/// when actual holdings deviate from policy parameters.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AssetAllocationPolicy {
+    pub asset: Address,
+    /// Minimum target allocation as a percentage (0–100, in basis points where 10000 = 100%)
+    pub min_allocation_bps: u32,
+    /// Maximum target allocation as a percentage (0–100, in basis points where 10000 = 100%)
+    pub max_allocation_bps: u32,
+    /// Timestamp when this policy was last updated
+    pub updated_at: u64,
+}
+
+/// Result of an allocation drift check (Issue #673).
+/// Identifies assets where actual holdings deviate from policy targets.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AllocationDrift {
+    pub asset: Address,
+    pub current_allocation_bps: u32,
+    pub target_min_bps: u32,
+    pub target_max_bps: u32,
+    /// true if current_allocation < target_min, false if > target_max
+    pub drifted_below: bool,
+}
+
+/// Versioned risk tier definition for governance-gated tier boundaries (Issue #674).
+/// Defines the score ranges that map risk scores (0–100) to risk tiers (AAA–C).
+/// Version-locking ensures in-flight listings remain tied to the tier definition
+/// active when they were created, preventing retroactive tier changes.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RiskTierDefinition {
+    /// Version identifier for this tier definition (incremented on each governance update)
+    pub version: u32,
+    /// Score range for AAA tier (top of range inclusive): 0..aaa_max
+    pub aaa_max: u32,
+    /// Score range for AA tier: aaa_max+1..aa_max
+    pub aa_max: u32,
+    /// Score range for A tier: aa_max+1..a_max
+    pub a_max: u32,
+    /// Score range for B tier: a_max+1..b_max
+    pub b_max: u32,
+    /// C tier: b_max+1..100 (always includes the top end)
+    /// Timestamp when this version was activated
+    pub activated_at: u64,
+}
+
+impl RiskTierDefinition {
+    /// Determine the risk tier for a given score using this tier definition
+    pub fn score_to_tier(&self, score: u32) -> RiskTier {
+        match score {
+            0..=20 if score <= self.aaa_max => RiskTier::AAA,
+            21..=40 if score <= self.aa_max => RiskTier::AA,
+            41..=60 if score <= self.a_max => RiskTier::A,
+            61..=80 if score <= self.b_max => RiskTier::B,
+            _ => RiskTier::C,
+        }
+    }
 }
 
 /// A privileged action awaiting a quorum of co-signer approvals.
-///
-/// Keyed by the action hash so that identical actions proposed by different
-/// signers collapse into a single queue entry. Once `approvals` reaches the
-/// configured threshold the action may be executed exactly once.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct PendingAction {
-    /// Hash identifying the action payload (see `AdminAction`).
     pub action_hash: BytesN<32>,
-    /// The action to execute once the threshold is met.
     pub action: AdminAction,
-    /// Distinct co-signers that have approved this action so far.
     pub approvals: Vec<Address>,
-    /// Ledger timestamp when the action was first proposed.
     pub proposed_at: u64,
-    /// Ledger timestamp after which the action expires and cannot execute.
     pub expires_at: u64,
-    /// Set once the action has been executed to prevent replays.
     pub executed: bool,
+}
+
+// ── Parameter Registry Types ──────────────────────────────────────────────────
+
+/// Keys identifying every governable protocol parameter stored in
+/// `parameter_registry`.  The same enum is used by consuming contracts to
+/// index their local cache, so callers never pass raw strings.
+///
+/// Adding a new parameter: append a new variant here and handle it in
+/// `parameter_registry`'s `set_parameter` dispatch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RegistryParamKey {
+    // ── Marketplace ───────────────────────────────────────────────────────────
+    /// Base protocol fee in basis points (0–10 000).
+    MarketplaceFeeBps,
+    /// Fraction of the protocol fee routed to the referrer (0–10 000 bps).
+    ReferrerSplitBps,
+    /// Minimum contribution floor per fund_invoice call (in token's smallest unit).
+    MinContributionAmount,
+    /// Per-risk-tier fee override — AAA tier (bps).
+    TierFeeAaa,
+    /// Per-risk-tier fee override — AA tier (bps).
+    TierFeeAa,
+    /// Per-risk-tier fee override — A tier (bps).
+    TierFeeA,
+    /// Per-risk-tier fee override — B tier (bps).
+    TierFeeB,
+    /// Per-risk-tier fee override — C tier (bps).
+    TierFeeC,
+    // ── Financing Pool ────────────────────────────────────────────────────────
+    /// Late-repayment penalty rate (bps).
+    LatePenaltyBps,
+    /// Fraction of late penalty routed to treasury vs investors (bps).
+    LatePenaltyTreasurySplitBps,
+    /// Maximum per-investor concentration per pool (bps, 1–10 000).
+    MaxPositionBps,
+    /// Grace period before a late invoice can be defaulted (seconds).
+    GracePeriodSecs,
+    // ── Risk Registry ─────────────────────────────────────────────────────────
+    /// Minimum stake amount for a verifier (in staking token's smallest unit).
+    MinimumVerifierStake,
+    /// Fraction of stake to slash per SME default (bps).
+    SlashPercentageBps,
+    /// Minimum acceptable average debtor risk score (0–100, 0 = no gate).
+    MinimumDebtorScore,
+    // ── Treasury ──────────────────────────────────────────────────────────────
+    /// Treasury protocol fee (bps).
+    TreasuryFeeBps,
+    /// Insurance reserve allocation from each fee collection (bps).
+    ReserveAllocationBps,
+}
+
+/// A single governed parameter value.
+///
+/// Parameters are stored as `i128` to accommodate both `u32` fee rates
+/// (which fit comfortably) and `i128` token amounts like `minimum_stake`.
+/// Consuming contracts are responsible for casting back to the expected type
+/// after reading; the registry enforces only the supplied min/max bounds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryParam {
+    /// The current governed value.
+    pub value: i128,
+    /// Lower bound (inclusive) for governance proposals (0 = no lower bound).
+    pub min_value: i128,
+    /// Upper bound (inclusive) for governance proposals (0 = no upper bound).
+    pub max_value: i128,
+    /// Ledger timestamp when this value was last updated.
+    pub updated_at: u64,
+    /// Address that last updated this value (governance contract or admin).
+    pub updated_by: Address,
+}
+
+// ── Contributor Badge Types ───────────────────────────────────────────────────
+
+/// Category of a contributor badge.  Determines the minting-authority check
+/// and may be used by future governance-weight integrations.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BadgeCategory {
+    /// Merged Wave issue or significant code contribution.
+    Code,
+    /// Verified security finding (bug bounty / audit).
+    Security,
+    /// Community service: verifier participation, governance, documentation.
+    Community,
+}
+
+/// On-chain record for a single contributor badge (non-transferable).
+///
+/// The badge is "soulbound" — the `owner` field is set at mint and the
+/// contract's `transfer` entry-point is intentionally absent.  The only
+/// state transitions allowed are `Active → Revoked` (admin revocation for
+/// fraudulent/erroneous badges).
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContributorBadge {
+    /// Monotonically-incrementing badge ID.
+    pub id: u64,
+    /// Address this badge is permanently bound to.
+    pub owner: Address,
+    /// Badge category (Code / Security / Community).
+    pub category: BadgeCategory,
+    /// Short human-readable description of the contribution (max 128 chars).
+    pub description: String,
+    /// IPFS CID of supporting evidence or linked PR/report.
+    pub evidence_cid: String,
+    /// Ledger timestamp when the badge was minted.
+    pub minted_at: u64,
+    /// Whether this badge has been revoked.
+    pub revoked: bool,
+    /// Ledger timestamp when revoked (0 if not revoked).
+    pub revoked_at: u64,
+    /// Optional free-text reason for revocation.
+    pub revocation_reason: Option<String>,
+}
+
+// ── Subject-Initiated Risk Score Dispute Types ────────────────────────────────
+
+/// Status of a subject-initiated risk-score dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScoreDisputeStatus {
+    /// Dispute filed, score flagged "under review".
+    Open,
+    /// Reviewer upheld the original score.
+    Upheld,
+    /// Reviewer adjusted the score (new value stored on the SME profile).
+    Adjusted,
+    /// Dispute was closed without a finding (e.g., subject withdrew it).
+    Dismissed,
+}
+
+/// A subject-initiated dispute against the subject's own risk score.
+///
+/// Rate-limited at the contract level (max one open dispute per subject per
+/// `SCORE_DISPUTE_RATE_WINDOW_SECS`) to prevent indefinite stalling of
+/// legitimate low scores via repeated filings.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ScoreDispute {
+    /// Monotonically-incrementing dispute ID.
+    pub id: u64,
+    /// The SME or debtor address that filed the dispute.
+    pub subject: Address,
+    /// Short human-readable reason for the dispute (max 256 chars).
+    pub reason: String,
+    /// Optional IPFS CID of supporting evidence provided by the subject.
+    pub evidence_cid: Option<String>,
+    /// Current status of the dispute.
+    pub status: ScoreDisputeStatus,
+    /// Ledger timestamp when the dispute was filed.
+    pub filed_at: u64,
+    /// Ledger timestamp when the dispute was resolved (0 if still open).
+    pub resolved_at: u64,
+    /// Address that resolved the dispute (admin/governance; None if open).
+    pub resolved_by: Option<Address>,
+    /// Free-text reasoning recorded on resolution for on-chain transparency.
+    pub resolution_notes: Option<String>,
+    /// The risk score at the time the dispute was filed (for audit trail).
+    pub score_at_filing: u32,
+}
+
+// ── Discretionary Treasury Withdrawal Proposal ───────────────────────────────
+
+/// A timelocked, multi-approver discretionary treasury withdrawal proposal.
+///
+/// This is the *strictly separate* path from the fee-sweep and grant-disbursement
+/// flows — any ad-hoc discretionary withdrawal must go through this proposal
+/// lifecycle rather than the direct `withdraw` admin path.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DiscretionaryWithdrawal {
+    /// Monotonically-incrementing proposal ID.
+    pub id: u64,
+    /// Token to withdraw.
+    pub token: Address,
+    /// Destination address (must be on the recipient allowlist).
+    pub recipient: Address,
+    /// Amount to withdraw.
+    pub amount: i128,
+    /// Free-text purpose description (max 256 chars) for on-chain transparency.
+    pub purpose: String,
+    /// Proposer address.
+    pub proposer: Address,
+    /// Addresses that have approved (quorum tracked against access_control multisig config).
+    pub approvals: Vec<Address>,
+    /// Ledger timestamp when proposed.
+    pub proposed_at: u64,
+    /// Ledger timestamp before which the proposal cannot be executed (timelock).
+    pub executable_after: u64,
+    /// Ledger timestamp after which the proposal expires.
+    pub expires_at: u64,
+    /// Whether the proposal has been executed.
+    pub executed: bool,
+    /// Whether the proposal has been cancelled.
+    pub cancelled: bool,
 }
